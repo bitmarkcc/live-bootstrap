@@ -26,11 +26,22 @@ done
 # The decimal version (with "%Lr") is not available in this version of stat.
 if [ $((0x$(stat -c "%T" "/dev/${DISK}") % 8)) -eq 0 ]; then
     echo "Creating partition table..."
-    # Start at 1GiB, use -S32 -H64 to align to MiB rather than cylinder boundary
-    echo "2097152;" | sfdisk -uS -S32 -H64 --force "/dev/${DISK}"
+    # PLX: two partitions instead of one. -S32 -H64 aligns to MiB (cyl = 2048 sectors).
+    #   sda1: start 2097152 (1 GiB), size 60817408 sectors (29 GiB) -- IDENTICAL extent to the
+    #         original single-partition layout (started at 1 GiB, filled a 30 GiB disk), so the
+    #         i686 bootstrap sees no difference. Ends at sector 62914560 (the old 30 GiB end).
+    #   sda2: start 62914560, size = rest of the disk (the space beyond the old 30 GiB) -- the
+    #         PLX amd64 root. It is ALREADY an ext4 filesystem, pre-populated with the Gentoo
+    #         distfiles at /var/cache/distfiles by lib/generator.py (write_plx_distfiles_sda2,
+    #         via mkfs.ext4 -E offset=). sfdisk only writes the partition table at sector 0 --
+    #         it does NOT touch sda2's data -- so the baked ext4 survives. Do NOT mkfs sda2
+    #         here (would erase the distfiles); the amd64 stage MOUNTS it, never reformats it.
+    #         If PLX_DISTFILES was empty at build time, sda2 is just unformatted space instead.
+    # Requires a disk larger than 30 GiB (run-qemu.sh DISK=64G -> sda2 ~= 34 GiB).
+    printf '%s\n' '2097152,60817408' '62914560,' | sfdisk -uS -S32 -H64 --force "/dev/${DISK}"
     fdisk -l "/dev/${DISK}"
     echo "Creating ext4 partition..."
-    mkfs.ext4 -F -F "/dev/${DISK}1"
+    mkfs.ext4 -F -F "/dev/${DISK}1"          # sda1 only; sda2 is pre-formatted (generator)
     DISK="${DISK}1"
     echo DISK="${DISK}" >> /steps/bootstrap.cfg
 fi

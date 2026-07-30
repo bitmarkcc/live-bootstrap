@@ -162,10 +162,12 @@ def main():
     if int(args.cores) < 1:
         raise ValueError("Must use one or more cores.")
 
-    # Target image size validation
-    if args.qemu:
+    # Target image size validation. Bare metal ALSO produces a disk image (kernel_bootstrap), so it
+    # needs a real size too -- upstream only sized it for --qemu, leaving --bare-metal at 0 (which
+    # then makes generator.write_plx_sda2 abort "disk too small"). Honour --target-size for both.
+    if args.qemu or args.bare_metal:
         if int(str(args.target_size).rstrip('gGmM')) < 1:
-            raise ValueError("Please specify a positive target size for qemu.")
+            raise ValueError("Please specify a positive target size for qemu/bare-metal.")
         args.target_size = (int(str(args.target_size).rstrip('gGmM')) *
             (1024 if str(args.target_size).lower().endswith('g') else 1))
     else:

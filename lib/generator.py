@@ -11,8 +11,11 @@ This file contains all code required to generate the boot image for live-bootstr
 import hashlib
 import os
 import random
+import shlex
 import shutil
+import subprocess
 import tarfile
+import tempfile
 import traceback
 
 import requests
@@ -270,6 +273,99 @@ class Generator():
         if current_size < size * megabyte:
             with open(image_file_name, 'ab') as image_file:
                 image_file.truncate(size * megabyte)
+
+        # PLX: pre-populate sda2 (distfiles + scripts + repo snapshot) as a ready-made ext4 fs
+        # (NOT via the srcfs, which builder-hex0 would grind through bare-metal). See the method.
+        self.write_plx_sda2(image_file_name, size)
+
+    @staticmethod
+    def write_plx_sda2(image_file_name, size_mb):
+        """PLX: pre-populate sda2 (the future amd64 root) as a ready-made ext4 filesystem so the
+        bootstrap is FULLY self-contained -- no host, no network, as on the real KGPE-D16 --
+        WITHOUT routing anything through builder-hex0's slow srcfs. Written straight into sda2's
+        region of the image via `mkfs.ext4 -E offset=` (move_disk.sh, PLX patch, defines the
+        partition at this same offset and does NOT mkfs it):
+          /var/cache/distfiles/<tarballs>   <- PLX_DISTFILES  (the Gentoo @system sources)
+          /root/tmp/bootstrap-amd64/        <- PLX_SCRIPTS     (the PLX bootstrap scripts, minus
+                                                                their own distfiles/ subdir)
+          /root/tmp/<basename>              <- PLX_SNAPSHOT    (the Gentoo ebuild repo snapshot)
+          /lb-distfiles/<tarballs>          <- PLX_LB_DISTFILES (live-bootstrap's OWN sources; PLX's
+                                                                 move_disk.sh copies these into
+                                                                 /external/distfiles at boot so LB's
+                                                                 late-era fetches read them locally
+                                                                 -- a single-disk offline bootstrap)
+        Any unset/missing env var => that piece is skipped; nothing to write => no-op.
+        """
+        plx_distfiles = os.environ.get('PLX_DISTFILES')
+        plx_scripts   = os.environ.get('PLX_SCRIPTS')
+        plx_snapshot  = os.environ.get('PLX_SNAPSHOT')
+        plx_lb_distfiles = os.environ.get('PLX_LB_DISTFILES')
+        do_distfiles = bool(plx_distfiles and os.path.isdir(plx_distfiles))
+        do_scripts   = bool(plx_scripts and os.path.isdir(plx_scripts))
+        do_snapshot  = bool(plx_snapshot and os.path.isfile(plx_snapshot))
+        do_lb_distfiles = bool(plx_lb_distfiles and os.path.isdir(plx_lb_distfiles))
+        if not (do_distfiles or do_scripts or do_snapshot or do_lb_distfiles):
+            return
+        # MUST match sda2's start sector in steps/jump/move_disk.sh: 62914560 (30 GiB).
+        sda2_offset = 62914560 * 512
+        if sda2_offset >= size_mb * 1024 * 1024:
+            raise ValueError(
+                f"disk ({size_mb} MiB) too small for sda2 at offset {sda2_offset} B -- "
+                "use a bigger DISK (>= ~32G) or unset the PLX_* vars")
+        print(f"PLX: building sda2 ext4 @ offset {sda2_offset}")
+        # Stage the fs contents on the SAME fs as the image (target dir); hardlink the (large)
+        # distfiles from PLX_DISTFILES when possible to avoid duplicating GBs / a /tmp tmpfs.
+        content = tempfile.mkdtemp(prefix='plx-sda2-', dir=os.path.dirname(image_file_name))
+        try:
+            if do_distfiles:
+                distdir = os.path.join(content, 'var', 'cache', 'distfiles')
+                os.makedirs(os.path.dirname(distdir))
+                try:
+                    shutil.copytree(plx_distfiles, distdir, copy_function=os.link)
+                except OSError:
+                    shutil.copytree(plx_distfiles, distdir)
+                print(f"  + /var/cache/distfiles <- {plx_distfiles}")
+            if do_scripts:
+                roottmp = os.path.join(content, 'root', 'tmp')
+                os.makedirs(roottmp, exist_ok=True)
+                name = os.path.basename(os.path.normpath(plx_scripts))   # e.g. bootstrap-amd64
+                # skip the scripts' own distfiles/ subdir -- already written above, and huge.
+                shutil.copytree(plx_scripts, os.path.join(roottmp, name),
+                                ignore=shutil.ignore_patterns('distfiles'))
+                print(f"  + /root/tmp/{name} <- {plx_scripts} (minus distfiles/)")
+            if do_snapshot:
+                roottmp = os.path.join(content, 'root', 'tmp')
+                os.makedirs(roottmp, exist_ok=True)
+                shutil.copy2(plx_snapshot, os.path.join(roottmp, os.path.basename(plx_snapshot)))
+                print(f"  + /root/tmp/{os.path.basename(plx_snapshot)} <- {plx_snapshot}")
+            if do_lb_distfiles:
+                # live-bootstrap's OWN source tarballs (bash-5.2.15.tar.gz, ...) -> sda2:/lb-distfiles.
+                # PLX's get_network.sh patch mounts sda2 at /mnt/amd64 and bind-mounts /lb-distfiles
+                # onto /external/distfiles just before the first network fetch, so download_source_line
+                # finds every source locally ([ -e $fname ]) and never fetches -- one disk, fully
+                # offline (no separate --external-sources disk). Hardlink to avoid duplicating GBs.
+                lbdir = os.path.join(content, 'lb-distfiles')
+                try:
+                    shutil.copytree(plx_lb_distfiles, lbdir, copy_function=os.link)
+                except OSError:
+                    shutil.copytree(plx_lb_distfiles, lbdir)
+                print(f"  + /lb-distfiles <- {plx_lb_distfiles}")
+            # -E offset= starts the fs at sda2's offset and fills to the image end (== sda2's
+            # extent, since move_disk gives sda2 "rest of disk"). Disable ext4 features newer
+            # than live-bootstrap's ~4.14 kernel, which also has to mount sda2 during the i686
+            # stage (orphan_file: 5.15, metadata_csum_seed: 4.15).
+            # Run UNDER fakeroot with the staging chowned to 0:0: mkfs -d preserves the staging's
+            # uid/gid, and this generator runs UNPRIVILEGED as the host user -- so WITHOUT fakeroot
+            # the baked /var,/root,... come out host-owned, and systemd-tmpfiles' "unsafe path
+            # transition" guard then fails on the amd64 system's first boot. fakeroot fakes root
+            # ownership so mkfs bakes root-owned dirs (needs `fakeroot` on the host PATH).
+            mkfs = (f"chown -R 0:0 {shlex.quote(content)} && "
+                    f"mkfs.ext4 -F -O ^orphan_file,^metadata_csum_seed "
+                    f"-E offset={sda2_offset} -d {shlex.quote(content)} "
+                    f"{shlex.quote(image_file_name)}")
+            subprocess.run(['fakeroot', 'sh', '-c', mkfs], check=True)
+        finally:
+            shutil.rmtree(content, ignore_errors=True)
 
     @staticmethod
     def check_file(file_name, expected_hash):
