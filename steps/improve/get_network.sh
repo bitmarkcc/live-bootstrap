@@ -17,13 +17,6 @@ plx_part2="/dev/${DISK%[0-9]}2"
 if [ -b "$plx_part2" ]; then
     mkdir -p /mnt/amd64
     grep -q " /mnt/amd64 " /proc/mounts || mount -t ext4 "$plx_part2" /mnt/amd64 2>/dev/null || true
-    # Root-own the baked sda2 payload. The generator writes sda2 via `mkfs.ext4 -d` under fakeroot on
-    # the image-prep host, but fakeroot's stat-faking can miss modern mke2fs syscalls (statx/
-    # newfstatat), leaking the prep host's uid (e.g. 1001) into baked dirs instead of root -- so /root
-    # etc. come out non-root-owned on the amd64 system. This is the FIRST place sda2 is mounted and we
-    # are root here, so normalize the whole baked payload once, up front. (07-portage later re-chowns
-    # /var/cache/distfiles + the ebuild repo to portage:portage, uid 250, which is the correct owner.)
-    grep -q " /mnt/amd64 " /proc/mounts && chown -R 0:0 /mnt/amd64
     if [ -d /mnt/amd64/lb-distfiles ]; then
         mkdir -p /external/distfiles
         grep -q " /external/distfiles " /proc/mounts || \
